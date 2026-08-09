@@ -1,19 +1,28 @@
 import colorsys
+import time
 import numpy as np
 import pyray as rl
 from cereal import messaging, car
 from dataclasses import dataclass, field
+from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.application import gui_app, FontWeight
+from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
 MAX_DRAW_DISTANCE = 100.0
+
+LEAD_INFO_FONT_SIZE = 38
+LEAD_INFO_TEXT_PADDING = 12
+LEAD_INFO_LINE_SPACING = 4
+LEAD_INFO_UPDATE_INTERVAL = 0.2  # seconds; refresh the distance/speed readout at most this often, averaged over the interval
 
 THROTTLE_COLORS = [
   rl.Color(13, 248, 122, 102),   # HSLF(148/360, 0.94, 0.51, 0.4)
@@ -39,6 +48,11 @@ class LeadVehicle:
   glow: list[float] = field(default_factory=list)
   chevron: list[float] = field(default_factory=list)
   fill_alpha: int = 0
+  distance_text: str = ""
+  speed_text: str = ""
+  text_x: float = 0.0
+  chevron_y: float = 0.0
+  chevron_size: float = 0.0
 
 
 class ModelRenderer(Widget):
@@ -52,6 +66,10 @@ class ModelRenderer(Widget):
     self._road_edge_stds = np.zeros(2, dtype=np.float32)
     self._lead_vehicles = [LeadVehicle(), LeadVehicle()]
     self._path_offset_z = HEIGHT_INIT[0]
+    self._lead_info_font = gui_app.font(FontWeight.SEMI_BOLD)
+    self._lead_info_samples: list[list[tuple[float, float]]] = [[], []]
+    self._lead_info_last_update: list[float] = [0.0, 0.0]
+    self._lead_info_text: list[tuple[str, str]] = [("", ""), ("", "")]
 
     # Initialize ModelPoints objects
     self._path = ModelPoints()
@@ -150,14 +168,18 @@ class ModelRenderer(Widget):
 
     for i, lead_data in enumerate(leads):
       if lead_data and lead_data.status:
-        d_rel, y_rel, v_rel = lead_data.dRel, lead_data.yRel, lead_data.vRel
+        d_rel, y_rel, v_rel, v_lead = lead_data.dRel, lead_data.yRel, lead_data.vRel, lead_data.vLead
         idx = self._get_path_length_idx(path_x_array, d_rel)
 
         # Get z-coordinate from path at the lead vehicle position
         z = self._path.raw_points[idx, 2] if idx < len(self._path.raw_points) else 0.0
         point = self._map_to_screen(d_rel, -y_rel, z + self._path_offset_z)
         if point:
-          self._lead_vehicles[i] = self._update_lead_vehicle(d_rel, v_rel, point, self._rect)
+          self._lead_vehicles[i] = self._update_lead_vehicle(i, d_rel, v_rel, v_lead, point, self._rect)
+      else:
+        self._lead_info_samples[i] = []
+        self._lead_info_last_update[i] = 0.0
+        self._lead_info_text[i] = ("", "")
 
   def _update_model(self, lead, path_x_array):
     """Update model visualization data based on model message"""
@@ -231,7 +253,7 @@ class ModelRenderer(Widget):
       stops=gradient_stops,
     )
 
-  def _update_lead_vehicle(self, d_rel, v_rel, point, rect):
+  def _update_lead_vehicle(self, i, d_rel, v_rel, v_lead, point, rect):
     speed_buff, lead_buff = 10.0, 40.0
 
     # Calculate fill alpha
@@ -253,7 +275,24 @@ class ModelRenderer(Widget):
     glow = [(x + (sz * 1.35) + g_xo, y + sz + g_yo), (x, y - g_yo), (x - (sz * 1.35) - g_xo, y + sz + g_yo)]
     chevron = [(x + (sz * 1.25), y + sz), (x, y), (x - (sz * 1.25), y + sz)]
 
-    return LeadVehicle(glow=glow, chevron=chevron, fill_alpha=int(fill_alpha))
+    speed = max(v_lead, 0.0) * (CV.MS_TO_KPH if ui_state.is_metric else CV.MS_TO_MPH)
+    self._lead_info_samples[i].append((d_rel, speed))
+
+    now = time.monotonic()
+    if now - self._lead_info_last_update[i] >= LEAD_INFO_UPDATE_INTERVAL:
+      samples = self._lead_info_samples[i]
+      avg_d_rel = sum(s[0] for s in samples) / len(samples)
+      avg_speed = sum(s[1] for s in samples) / len(samples)
+      speed_unit = tr("km/h") if ui_state.is_metric else tr("mph")
+      self._lead_info_text[i] = (f"{avg_d_rel:.0f} m", f"{avg_speed:.0f} {speed_unit}")
+      self._lead_info_samples[i] = []
+      self._lead_info_last_update[i] = now
+
+    distance_text, speed_text = self._lead_info_text[i]
+
+    return LeadVehicle(glow=glow, chevron=chevron, fill_alpha=int(fill_alpha),
+                        distance_text=distance_text, speed_text=speed_text,
+                        text_x=x, chevron_y=y, chevron_size=sz)
 
   def _draw_lane_lines(self):
     """Draw lane lines and road edges"""
@@ -307,6 +346,24 @@ class ModelRenderer(Widget):
 
       rl.draw_triangle_fan(lead.glow, len(lead.glow), rl.Color(218, 202, 37, 255))
       rl.draw_triangle_fan(lead.chevron, len(lead.chevron), rl.Color(201, 34, 49, lead.fill_alpha))
+
+      lines = [line for line in (lead.distance_text, lead.speed_text) if line]
+      if not lines:
+        continue
+
+      line_sizes = [measure_text_cached(self._lead_info_font, line, LEAD_INFO_FONT_SIZE) for line in lines]
+      total_height = sum(size.y for size in line_sizes) + LEAD_INFO_LINE_SPACING * (len(lines) - 1)
+
+      # Draw below the chevron by default; flip above it if that would run off the bottom of the screen
+      below_y = lead.chevron_y + lead.chevron_size + LEAD_INFO_TEXT_PADDING
+      if below_y + total_height > self._rect.y + self._rect.height - LEAD_INFO_TEXT_PADDING:
+        y = lead.chevron_y - LEAD_INFO_TEXT_PADDING - total_height
+      else:
+        y = below_y
+
+      for line, text_size in zip(lines, line_sizes, strict=True):
+        rl.draw_text_ex(self._lead_info_font, line, rl.Vector2(lead.text_x - text_size.x / 2, y), LEAD_INFO_FONT_SIZE, 0, rl.WHITE)
+        y += text_size.y + LEAD_INFO_LINE_SPACING
 
   @staticmethod
   def _get_path_length_idx(pos_x_array: np.ndarray, path_distance: float) -> int:
