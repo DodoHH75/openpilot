@@ -396,6 +396,24 @@ class Tici(HardwareBase):
     for n in camera_irqs:
       affine_irq(6, n)
 
+    # *** aux USB port power management ***
+
+    # The aux port hosts the joystick-mode gamepad. Left in runtime
+    # autosuspend (auto), an idle DualSense re-registers its HID interface
+    # every few seconds, and a suspend mid-drive kills the event stream the
+    # joystick reader holds (tools/joystick/joystick_control.py recovers, at
+    # the cost of ~1 s of zeroed axes while engaged). So: no suspend while
+    # onroad, kernel default while the car sleeps. Bus 1 is the internal LTE
+    # modem and is never touched. The aux port enumerates on the xhci root
+    # hubs: a USB2 device appears at 3-1, a USB3 device at 2-1. The node
+    # exists only while something is plugged in, so a device plugged
+    # mid-drive keeps the kernel default until the next transition.
+    usb_pm = 'auto' if powersave_enabled else 'on'
+    for port in ('2-1', '3-1'):
+      path = f'/sys/bus/usb/devices/{port}/power/control'
+      if os.path.exists(path):
+        sudo_write(usb_pm, path)
+
   def get_gpu_usage_percent(self):
     try:
       with open('/sys/class/kgsl/kgsl-3d0/gpubusy') as f:
