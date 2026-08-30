@@ -2,7 +2,9 @@
 import os
 import argparse
 import threading
+import time
 import numpy as np
+import inputs
 from inputs import UnpluggedError, get_gamepad
 
 from cereal import messaging
@@ -65,7 +67,17 @@ class Joystick:
     try:
       joystick_event = get_gamepad()[0]
     except (OSError, UnpluggedError):
+      # Fail safe: zero the axes so joystickd commands nothing while the
+      # pad is gone. Then rescan: the inputs library builds its device list
+      # once at import, so a pad that arrives late, drops off the bus, or
+      # re-registers its HID interface (a DualSense on this port does,
+      # repeatedly) would otherwise stay invisible until process restart.
       self.axes_values = dict.fromkeys(self.axes_values, 0.)
+      time.sleep(1.0)
+      try:
+        inputs.devices = inputs.DeviceManager()
+      except Exception:
+        pass
       return False
 
     event = (joystick_event.code, joystick_event.state)
